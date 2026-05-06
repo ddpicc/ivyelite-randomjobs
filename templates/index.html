@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PDF 解析演示</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/style.css') }}" />
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <p class="eyebrow">FastAPI + Python</p>
+      <h1>上传 PDF，提取基础结构化数据</h1>
+      <p class="intro">
+        当前版本会提取页数、标题、发票号候选、邮箱、手机号、日期、金额以及文本预览。
+        如果你的目标字段更明确，可以把规则改成定向抽取。
+      </p>
+    </section>
+
+    <section class="panel">
+      <form action="/upload" method="post" enctype="multipart/form-data" class="upload-form">
+        <label for="file" class="upload-label">选择 PDF 文件</label>
+        <input id="file" name="file" type="file" accept=".pdf,application/pdf" required />
+        <button type="submit">上传并解析</button>
+      </form>
+
+      {% if error %}
+      <div class="message error">{{ error }}</div>
+      {% endif %}
+    </section>
+
+    {% if result %}
+    <section class="results">
+      <article class="card">
+        <h2>解析结果</h2>
+        <dl class="meta-grid">
+          <div>
+            <dt>文件名</dt>
+            <dd>{{ result.filename }}</dd>
+          </div>
+          <div>
+            <dt>页数</dt>
+            <dd>{{ result.page_count }}</dd>
+          </div>
+          <div>
+            <dt>标题</dt>
+            <dd>{{ result.title or '未识别' }}</dd>
+          </div>
+          <div>
+            <dt>发票号候选</dt>
+            <dd>{{ result.invoice_number or '未识别' }}</dd>
+          </div>
+        </dl>
+      </article>
+
+      <article class="card">
+          <h2>合同信息</h2>
+          <form id="writeForm">
+            <div class="sheet-id-row">
+              <label for="field_sheet_id">Sheet ID</label>
+              <input type="text" name="sheet_id" id="field_sheet_id" value="{{ result.sheet_id or '135QulOdaQZHcAGQHia4Bq-buJnloHsX5iATPuJYUuf8' }}" style="width: 300px;" />
+            </div>
+            <dl class="meta-grid">
+              <div>
+                <dt>委托人</dt>
+                <dd><input type="text" name="client_name" id="field_client_name" value="{{ result.client_name or '' }}" /></dd>
+              </div>
+              <div>
+                <dt>委托人联系方式</dt>
+                <dd><input type="text" name="client_contact" id="field_client_contact" value="{{ result.client_contact or '' }}" /></dd>
+              </div>
+              <div>
+                <dt>选择的计划</dt>
+                <dd><input type="text" name="plan_name" id="field_plan_name" value="{{ result.plan_name or '' }}" /></dd>
+              </div>
+              <div>
+                <dt>基础服务费</dt>
+                <dd><input type="text" name="base_fee" id="field_base_fee" value="{{ result.base_fee or '' }}" /></dd>
+              </div>
+              <div>
+                <dt>首付款</dt>
+                <dd><input type="text" name="down_payment" id="field_down_payment" value="{{ result.down_payment or '' }}" /></dd>
+              </div>
+            </dl>
+            <button type="submit" class="btn-write">写入 Google Sheet</button>
+          </form>
+        </article>
+
+      <article class="card">
+        <h2>文本预览</h2>
+        <pre class="preview">{{ result.text_preview }}</pre>
+      </article>
+    </section>
+    {% endif %}
+
+    {% if written %}
+    <section class="results">
+      <div class="message success">
+        ✅ 数据已写入 Excel（第 {{ row_num }} 行），应付尾款公式已自动计算。
+      </div>
+    </section>
+    {% endif %}
+  </main>
+  <script>
+    document.getElementById('writeForm').addEventListener('submit', async function(e) {
+      e.preventDefault();
+      var btn = this.querySelector('.btn-write');
+      btn.disabled = true;
+      btn.textContent = '写入中...';
+
+      var data = {
+        sheet_id: document.getElementById('field_sheet_id').value,
+        client_name: document.getElementById('field_client_name').value,
+        client_contact: document.getElementById('field_client_contact').value,
+        plan_name: document.getElementById('field_plan_name').value,
+        base_fee: document.getElementById('field_base_fee').value,
+        down_payment: document.getElementById('field_down_payment').value,
+      };
+
+      try {
+        var formData = new FormData();
+        for (var key in data) {
+          formData.append(key, data[key]);
+        }
+        var response = await fetch('/write-to-excel', {
+          method: 'POST',
+          body: JSON.stringify({ result: data }),
+          headers: { 'Content-Type': 'application/json' },
+        });
+        var html = await response.text();
+        document.documentElement.innerHTML = html;
+      } catch (err) {
+        alert('写入失败: ' + err.message);
+        btn.disabled = false;
+        btn.textContent = '写入 Excel';
+      }
+    });
+  </script>
+</body>
+</html>
