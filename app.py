@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import re
 from io import BytesIO
 from pathlib import Path
@@ -200,9 +202,15 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
 def _get_sheets_service():
-    creds = service_account.Credentials.from_service_account_file(
-        BASE_DIR / "credentials.json", scopes=SCOPES
-    )
+    creds_info = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    if creds_info:
+        creds = service_account.Credentials.from_service_account_info(
+            json.loads(creds_info), scopes=SCOPES
+        )
+    else:
+        creds = service_account.Credentials.from_service_account_file(
+            BASE_DIR / "credentials.json", scopes=SCOPES
+        )
     return build("sheets", "v4", credentials=creds)
 
 
