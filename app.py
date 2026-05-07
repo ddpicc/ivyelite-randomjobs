@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import unicodedata
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from urllib import error, request as urllib_request
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse
@@ -32,10 +34,10 @@ def extract_pdf_data(file_bytes: bytes, filename: str) -> dict[str, Any]:
     page_texts: list[str] = []
     for page in reader.pages:
         text = page.extract_text() or ""
-        page_texts.append(text.strip())
+        page_texts.append(_normalize_text(text))
 
-    full_text = "\n".join(text for text in page_texts if text).strip()
-    full_text = full_text.replace('\x00', '')
+    clean_lines = _build_clean_lines(page_texts)
+    full_text = "\n".join(clean_lines).strip()
     if not full_text:
         full_text = "未提取到可读文本，可能是扫描版 PDF，需要接入 OCR。"
 
@@ -67,54 +69,8 @@ def extract_pdf_data(file_bytes: bytes, filename: str) -> dict[str, Any]:
             r"(?:编号|单号)[:：]?\s*([A-Za-z0-9-]{6,})",
         ],
     )
-    title = (reader.metadata.title if reader.metadata else None) or _guess_title(page_texts)
-
-    client_contact = None
-    client_name = None
-
-    docusign_patterns = [
-        r"Docusign Envelope ID:[^\n]+\n(?:[^\n]*\n){0,5}\s*(\d{10,11}|(?:\d{3}[-\s]?\d{3}[-\s]?\d{4}))\s*\n\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?|[\u4e00-\u9fa5]+)\s*$",
-        r"Docusign Envelope ID:[^\n]+\n\s*(\d{3}[-\s]?\d{3}[-\s]?\d{4})\s*\n\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s*$",
-        r"Docusign Envelope ID:[^\n]+\n\s*(\d{10})\s*\n.*?\n\s*([\u4e00-\u9fa5]+)\s*$",
-        r"Docusign Envelope ID:[^\n]+\n\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s*\n\s*(\d{10,11}|(?:\d{3}[-\s]?\d{3}[-\s]?\d{4}))\s*$",
-        r"Docusign Envelope ID:[^\n]+\n\s*([\u4e00-\u9fa5]+)\s*\n\s*(\d{10,11}|(?:\d{3}[-\s]?\d{3}[-\s]?\d{4}))\s*$",
-    ]
-
-    for pattern in docusign_patterns:
-        docusign_match = re.search(pattern, full_text, re.MULTILINE)
-        if docusign_match:
-            # Determine which group is phone vs name based on pattern type
-            if pattern == docusign_patterns[3] or pattern == docusign_patterns[4]:
-                # name first, phone second -> swap
-                client_name = docusign_match.group(1)
-                client_contact = docusign_match.group(2)
-            else:
-                client_contact = docusign_match.group(1)
-                client_name = docusign_match.group(2)
-            break
-
-    if not client_contact:
-        client_contact = _search_first(
-            full_text,
-            [
-                r"(?:委托人联系方式|联系电话|联系方式)[:：]?\s*([^\n\r]+)",
-            ],
-        )
-
-    if not client_contact:
-        phone_matches = re.findall(r"\(?\d{3}\)?[-\s]?\d{3}[-\s]?\d{4}", full_text)
-        valid_phones = [p for p in phone_matches if not p.startswith('0') and not p.startswith('510') and len(p.replace('-', '').replace(' ', '').replace('(', '').replace(')', '')) == 10]
-        if valid_phones:
-            client_contact = valid_phones[-1].strip('()')
-
-    if not client_name:
-        client_name = _search_first(
-            full_text,
-            [
-                r"(?:委托人|客户姓名|申请人|姓名)[:：]?\s*([^\n\r]+)",
-                r"(?:Client|Name)[:：]?\s*([^\n\r]+)",
-            ],
-        )
+    title = (reader.metadata.title if reader.metadata else None) or _guess_title(clean_lines)
+    client_name = _extract_client_name(full_text, clean_lines, filename)
 
     plan_name = _search_first(
         full_text,
@@ -134,32 +90,10 @@ def extract_pdf_data(file_bytes: bytes, filename: str) -> dict[str, Any]:
     if plan_name:
         plan_name = ''.join(plan_name.split())
 
-    base_fee = _search_first(
-        full_text,
-        [
-            r"基础服务费为\s*([0-9,]+)",
-            r"基础费用\s*([0-9,]+)",
-            r"基础服务费\s*([0-9,]+)",
-            r"总费用为\s*([0-9,]+)",
-            r"服务总费用为\s*([0-9,]+)",
-        ],
-    )
-    if base_fee:
-        base_fee = base_fee.replace(',', '')
+    base_fee = _extract_base_fee(clean_lines, full_text)
+    down_payment = _extract_down_payment(clean_lines, full_text)
 
-    down_payment = _search_first(
-        full_text,
-        [
-            r"服务费定金\s*([0-9,]+)",
-            r"第一笔服务费[^\d]*?([0-9,]+)\s*(?:美元|元|円)",
-            r"首付[^\d]*?([0-9,]+)",
-            r"定金\s*([0-9,]+)\s*美元",
-        ],
-    )
-    if down_payment:
-        down_payment = down_payment.replace(',', '')
-
-    return {
+    result = {
         "filename": filename,
         "page_count": len(reader.pages),
         "title": title,
@@ -170,11 +104,14 @@ def extract_pdf_data(file_bytes: bytes, filename: str) -> dict[str, Any]:
         "money_values": money_values[:20],
         "text_preview": full_text[:4000],
         "client_name": client_name,
-        "client_contact": client_contact,
         "plan_name": plan_name,
         "base_fee": base_fee,
         "down_payment": down_payment,
     }
+    refined = _maybe_refine_with_ai(full_text, filename, result)
+    if refined:
+        result.update({key: value for key, value in refined.items() if value})
+    return result
 
 
 def _search_first(text: str, patterns: list[str]) -> str | None:
@@ -188,13 +125,279 @@ def _search_first(text: str, patterns: list[str]) -> str | None:
     return None
 
 
-def _guess_title(page_texts: list[str]) -> str | None:
+def _normalize_text(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text or "")
+    text = text.replace("\x00", "")
+    text = text.replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{2,}", "\n", text)
+    return text.strip()
+
+
+def _build_clean_lines(page_texts: list[str]) -> list[str]:
+    lines: list[str] = []
     for page_text in page_texts:
-        for line in page_text.splitlines():
-            cleaned = line.strip()
-            if 4 <= len(cleaned) <= 60:
-                return cleaned
+        for raw_line in page_text.splitlines():
+            cleaned = raw_line.strip(" \t\n\r\f\v\u3000")
+            if not cleaned:
+                continue
+            cleaned = re.sub(r"\s+", " ", cleaned)
+            lines.append(cleaned)
+    return lines
+
+
+def _guess_title(lines: list[str]) -> str | None:
+    for cleaned in lines:
+        if 4 <= len(cleaned) <= 60:
+            return cleaned
     return None
+
+
+def _extract_client_name(full_text: str, lines: list[str], filename: str) -> str | None:
+    candidates: list[tuple[int, str]] = []
+
+    regex_candidates = [
+        _search_first(
+            full_text,
+            [
+                r"客户姓名[:：]\s*([^\n\r]{1,40})",
+                r"申请人[:：]\s*([^\n\r]{1,40})",
+                r"姓名[:：]\s*([^\n\r]{1,40})",
+                r"委托人[:：]?\s*([A-Za-z][A-Za-z .'-]{1,40}|[\u4e00-\u9fff·]{2,12})",
+            ],
+        )
+    ]
+    for candidate in regex_candidates:
+        score = _score_name_candidate(candidate)
+        if score > 0:
+            candidates.append((score + 15, candidate.strip()))
+
+    for index, line in enumerate(lines):
+        if "Docusign Envelope ID" not in line:
+            continue
+        block = lines[index + 1: index + 6]
+        for candidate in block:
+            score = _score_name_candidate(candidate)
+            if score <= 0:
+                continue
+            block_bonus = 50
+            if any(_looks_like_phone_or_id(item) for item in block if item != candidate):
+                block_bonus += 10
+            candidates.append((score + block_bonus, candidate))
+
+    for index, line in enumerate(lines):
+        score = _score_name_candidate(line)
+        if score <= 0:
+            continue
+        if len(line) > 20:
+            continue
+        bonus = 0
+        window = lines[max(0, index - 2): min(len(lines), index + 3)]
+        joined_window = " ".join(window)
+        if any("Docusign Envelope ID" in item for item in window):
+            bonus += 25
+        if "委托人" in joined_window:
+            bonus += 10
+        if index > 0 and "Docusign Envelope ID" in lines[index - 1]:
+            bonus += 30
+        if index > 1 and "Docusign Envelope ID" in lines[index - 2]:
+            bonus += 20
+        candidates.append((score + bonus, line))
+
+    filename_candidate = _extract_name_from_filename(filename)
+    filename_score = _score_name_candidate(filename_candidate)
+    if filename_score > 0:
+        candidates.append((filename_score + 5, filename_candidate.strip()))
+
+    if not candidates:
+        return None
+
+    best_score, best_name = max(candidates, key=lambda item: (item[0], len(item[1])))
+    if best_score < 40:
+        return None
+    if filename_candidate and _should_prefer_filename_name(best_name, filename_candidate):
+        return filename_candidate.strip()
+    return best_name
+
+
+def _extract_name_from_filename(filename: str) -> str | None:
+    stem = Path(filename).stem
+    stem = re.sub(r"^Copy of\s*", "", stem, flags=re.IGNORECASE)
+    stem = re.sub(r"^请使用\s*Docusign\s*签署[:：]\s*", "", stem, flags=re.IGNORECASE)
+    stem = stem.replace("_-_", "-")
+    parts = [part.strip() for part in re.split(r"[-—]+", stem) if part.strip()]
+    if not parts:
+        return None
+    candidate = parts[-1]
+    candidate = re.sub(r"\bpdf\b$", "", candidate, flags=re.IGNORECASE).strip()
+    candidate = candidate.replace("_", " ")
+    return candidate or None
+
+
+def _score_name_candidate(candidate: str | None) -> int:
+    if not candidate:
+        return 0
+    raw = candidate.strip()
+    text = raw.strip(" :：,，")
+    if len(text) < 2 or len(text) > 40:
+        return 0
+    if re.search(r"\d", text):
+        return 0
+    if sum(ch.isalpha() for ch in text) == 0 and not re.search(r"[\u4e00-\u9fff]", text):
+        return 0
+
+    invalid_fragments = [
+        "委托人", "受托人", "通讯地址", "联系方式", "护照号码", "合同", "申请计划", "服务费", "地址",
+        "项目", "美国", "中国", "签字", "日期", "第一条", "第二条", "第三条", "第四条", "第五条",
+        "第六条", "第七条", "第八条", "第九条", "当事人", "留学", "面试", "录取", "Bank", "Name:",
+        "法律", "效力", "文件", "协议", "条款", "关文件",
+        "常青藤精英教育", "Ivy Elite", "Yifei Sang",
+    ]
+    if any(fragment in text for fragment in invalid_fragments):
+        return 0
+    if re.search(r"[,:：;；。()（）/]", raw):
+        return 0
+
+    if re.fullmatch(r"[\u4e00-\u9fff·]{2,8}", text):
+        return 85
+    if re.fullmatch(r"[A-Z][a-z]+(?: [A-Z][a-z]+){1,3}", text):
+        return 80
+    if re.fullmatch(r"[A-Z][a-z]+", text):
+        return 55
+    if re.fullmatch(r"[A-Za-z]+(?: [A-Za-z]+){1,3}", text):
+        return 45
+    return 0
+
+
+def _extract_base_fee(lines: list[str], full_text: str) -> str | None:
+    for line in lines:
+        for pattern in [
+            r"基础服务费(?:为)?\s*([0-9,]+)\s*美元",
+            r"基础费用\s*([0-9,]+)\s*美元",
+            r"服务总费用为\s*([0-9,]+)\s*美元",
+            r"总费用为\s*([0-9,]+)\s*美元",
+        ]:
+            match = re.search(pattern, line, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).replace(",", "")
+
+    match = re.search(r"总费用为\s*([0-9,]+)\s*美元", full_text, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).replace(",", "")
+    return None
+
+
+def _extract_down_payment(lines: list[str], full_text: str) -> str | None:
+    for line in lines:
+        for pattern in [
+            r"服务费定金\s*([0-9,]+)\s*美元",
+            r"支付第一笔(?:服务费)?(?:定金)?\s*([0-9,]+)\s*美元",
+            r"第一笔[^\d]{0,20}([0-9,]+)\s*美元",
+            r"定金\s*([0-9,]+)\s*美元",
+            r"首付[^\d]*([0-9,]+)\s*美元",
+        ]:
+            match = re.search(pattern, line, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).replace(",", "")
+
+    match = re.search(r"定金\s*([0-9,]+)\s*美元", full_text, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).replace(",", "")
+    return None
+
+
+def _looks_like_phone_or_id(text: str) -> bool:
+    cleaned = text.strip()
+    return bool(
+        re.fullmatch(r"(?:\+?\d[\d -]{7,}|\d{8,}|[A-Z]{1,3}\d{6,10})", cleaned)
+    )
+
+
+def _should_prefer_filename_name(extracted_name: str, filename_name: str) -> bool:
+    extracted = extracted_name.strip()
+    filename_clean = filename_name.strip()
+    if not extracted or not filename_clean:
+        return False
+    if extracted == filename_clean:
+        return False
+    if re.fullmatch(r"[A-Z][a-z]+", extracted) and re.fullmatch(
+        r"[A-Z][a-z]+(?: [A-Z][a-z]+){1,3}", filename_clean
+    ):
+        filename_parts = filename_clean.split()
+        return extracted in filename_parts
+    return False
+
+
+def _maybe_refine_with_ai(full_text: str, filename: str, result: dict[str, Any]) -> dict[str, str] | None:
+    if os.environ.get("PDF_EXTRACT_ENABLE_AI_REFINE", "").lower() not in {"1", "true", "yes"}:
+        return None
+    if not os.environ.get("OPENAI_API_KEY"):
+        return None
+    needs_refine = (
+        not result.get("client_name")
+        or not result.get("plan_name")
+        or not result.get("base_fee")
+        or not result.get("down_payment")
+    )
+    if not needs_refine:
+        return None
+
+    model = os.environ.get("PDF_EXTRACT_REFINE_MODEL")
+    if not model:
+        return None
+
+    prompt = {
+        "filename": filename,
+        "current_result": {
+            "client_name": result.get("client_name"),
+            "plan_name": result.get("plan_name"),
+            "base_fee": result.get("base_fee"),
+            "down_payment": result.get("down_payment"),
+        },
+        "task": "从合同文本中修正字段。只返回JSON，字段仅包含 client_name, plan_name, base_fee, down_payment。拿不准就返回空字符串，不要猜。",
+        "text": full_text[:12000],
+    }
+    body = json.dumps(
+        {
+            "model": model,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你是严谨的合同信息提取器，只能从原文中提取，不得脑补。",
+                },
+                {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+            ],
+        }
+    ).encode("utf-8")
+    req = urllib_request.Request(
+        os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/") + "/chat/completions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (error.URLError, TimeoutError, json.JSONDecodeError):
+        return None
+
+    content = payload.get("choices", [{}])[0].get("message", {}).get("content")
+    if not content:
+        return None
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return None
+    return {
+        "client_name": data.get("client_name", "").strip(),
+        "plan_name": data.get("plan_name", "").strip(),
+        "base_fee": re.sub(r"[^\d]", "", data.get("base_fee", "")),
+        "down_payment": re.sub(r"[^\d]", "", data.get("down_payment", "")),
+    }
 
 
 SHEET_ID = "135QulOdaQZHcAGQHia4Bq-buJnloHsX5iATPuJYUuf8"
